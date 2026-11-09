@@ -220,15 +220,8 @@ impl ConnectionTask {
         let mut write_buf = BytesMut::new();
         let mut stream = Framed::new(self.stream, LengthDelimitedCodec::new());
 
-        let tunnel_info = {
-            let Some(tun) = flow.tunnel_info else {
-                bail!("no tunnel info")
-            };
-            TunnelInfo::LocalRedirector {
-                pid: tun.pid,
-                process_name: tun.process_name,
-                remote_endpoint: None,
-            }
+        let Some(tun) = flow.tunnel_info else {
+            bail!("no tunnel info")
         };
         let local_address = {
             let Some(addr) = &flow.local_address else {
@@ -240,7 +233,7 @@ impl ConnectionTask {
         let mut remote_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let (command_tx, mut command_rx) = unbounded_channel();
 
-        let mut first_packet = Some((tunnel_info, local_address, command_tx));
+        let mut first_packet = Some((tun, local_address, command_tx));
 
         let mut state = ConnectionState::default();
 
@@ -251,19 +244,22 @@ impl ConnectionTask {
                     let packet = ipc::UdpPacket::decode(
                         packet.context("IPC read error")?
                     ).context("invalid IPC message")?;
-                    let dst_addr = {
-                        let Some(dst_addr) = &packet.remote_address else { bail!("no remote addr") };
-                        SocketAddr::try_from(dst_addr).with_context(|| format!("invalid remote_address: {dst_addr:?}"))?
-                    };
+                    let Some(remote) = &packet.remote_address else { bail!("no remote addr") };
+                    let dst_addr = SocketAddr::try_from(remote).with_context(|| format!("invalid remote_address: {remote:?}"))?;
 
                     // We can only send ConnectionEstablished once we know the destination address.
-                    if let Some((tunnel_info, local_address, command_tx)) = first_packet.take() {
+                    if let Some((tun, local_address, command_tx)) = first_packet.take() {
                         remote_address = dst_addr;
                         self.events.send(TransportEvent::ConnectionEstablished {
                             connection_id: ConnectionIdGenerator::udp().next_id(),
                             src_addr: local_address,
                             dst_addr,
-                            tunnel_info,
+                            // The host keeps its scope (e.g. fe80::1%en0), which a link-local destination needs.
+                            tunnel_info: TunnelInfo::LocalRedirector {
+                                pid: tun.pid,
+                                process_name: tun.process_name,
+                                remote_endpoint: Some((remote.host.clone(), remote.port as u16)),
+                            },
                             command_tx: Some(command_tx),
                         }).await?;
                     } else if remote_address != dst_addr {
@@ -428,6 +424,52 @@ mod tests {
             panic!("expected TCP connection");
         };
         (client, task, command_tx, connection_id, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn udp_remote_endpoint_keeps_scope() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = shutdown::channel();
+        tokio::spawn(ConnectionTask::new(server, events_tx, shutdown_rx).run());
+
+        let handshake = NewFlow {
+            message: Some(ipc::new_flow::Message::Udp(UdpFlow {
+                local_address: Some(ipc::Address {
+                    host: "fe80::2%en0".into(),
+                    port: 5353,
+                }),
+                tunnel_info: Some(ipc::TunnelInfo {
+                    pid: None,
+                    process_name: None,
+                }),
+            })),
+        }
+        .encode_to_vec();
+        client.write_u32(handshake.len() as u32).await.unwrap();
+        client.write_all(&handshake).await.unwrap();
+        let packet = ipc::UdpPacket {
+            data: Bytes::from_static(b"query"),
+            remote_address: Some(ipc::Address {
+                host: "fe80::1%en0".into(),
+                port: 53,
+            }),
+        }
+        .encode_to_vec();
+        client.write_u32(packet.len() as u32).await.unwrap();
+        client.write_all(&packet).await.unwrap();
+
+        let Some(TransportEvent::ConnectionEstablished {
+            tunnel_info:
+                TunnelInfo::LocalRedirector {
+                    remote_endpoint, ..
+                },
+            ..
+        }) = events_rx.recv().await
+        else {
+            panic!("expected UDP connection");
+        };
+        assert_eq!(remote_endpoint, Some(("fe80::1%en0".to_string(), 53)));
     }
 
     #[tokio::test]
