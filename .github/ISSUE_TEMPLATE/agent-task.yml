@@ -1,0 +1,9 @@
+name: Agent task
+description: A task for the factory's agent. Add the agent label when it is ready.
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What you want done
+    validations:
+      required: true
