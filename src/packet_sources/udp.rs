@@ -128,15 +128,19 @@ impl PacketSourceTask for UdpTask {
                         continue;
                     }
                     let (len, src_addr) = r.context("UDP recv() failed")?;
-                    self.handler.receive_data(
+                    let event = self.handler.receive_data(
                         UdpPacket {
                             src_addr,
                             dst_addr: self.local_addr,
                             payload: udp_buf[..len].to_vec(),
                         },
                         TunnelInfo::None {},
-                        permit.take().unwrap()
+                        None,
                     );
+                    let permit = permit.take().unwrap();
+                    if let Some(event) = event {
+                        permit.send(event);
+                    }
                 },
                 // send_to is cancel safe, so we can use that for backpressure.
                 r = self.socket.send_to(&packet_payload, packet_dst), if packet_needs_sending => {
