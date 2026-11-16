@@ -196,8 +196,34 @@ mod tests {
     #[tokio::test]
     async fn udp_client_delivers_broadcast() -> Result<()> {
         let server = UdpSocket::bind("0.0.0.0:0").await?;
+        #[cfg(target_os = "macos")]
+        let destination = {
+            let mut interfaces = std::ptr::null_mut();
+            if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let mut next = interfaces;
+            let mut broadcast = None;
+            while let Some(interface) = unsafe { next.as_ref() } {
+                if interface.ifa_flags & libc::IFF_UP as u32 != 0
+                    && !interface.ifa_addr.is_null()
+                    && unsafe { (*interface.ifa_addr).sa_family } as i32 == libc::AF_INET
+                    && interface.ifa_flags & libc::IFF_BROADCAST as u32 != 0
+                    && !interface.ifa_dstaddr.is_null()
+                {
+                    let address = unsafe { &*interface.ifa_dstaddr.cast::<libc::sockaddr_in>() };
+                    broadcast = Some(Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()));
+                    break;
+                }
+                next = interface.ifa_next;
+            }
+            unsafe { libc::freeifaddrs(interfaces) };
+            broadcast.context("no active IPv4 broadcast interface")?
+        };
+        #[cfg(not(target_os = "macos"))]
+        let destination = Ipv4Addr::BROADCAST;
         let socket =
-            udp_connect("255.255.255.255".into(), server.local_addr()?.port(), None).await?;
+            udp_connect(destination.to_string(), server.local_addr()?.port(), None).await?;
         socket.send(b"broadcast").await?;
         let mut buffer = [0; 32];
         let (size, _) = tokio::time::timeout(
