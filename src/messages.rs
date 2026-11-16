@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fmt::Formatter;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 use internet_packet::{InternetPacket, TransportProtocol};
@@ -38,18 +39,19 @@ pub enum NetworkCommand {
     SendPacket(SmolPacket),
 }
 
-pub struct ConnectionIdGenerator(usize);
+static NEXT_TCP_ID: AtomicUsize = AtomicUsize::new(2);
+static NEXT_UDP_ID: AtomicUsize = AtomicUsize::new(3);
+
+pub struct ConnectionIdGenerator(&'static AtomicUsize);
 impl ConnectionIdGenerator {
     pub const fn tcp() -> Self {
-        Self(2)
+        Self(&NEXT_TCP_ID)
     }
     pub const fn udp() -> Self {
-        Self(3)
+        Self(&NEXT_UDP_ID)
     }
     pub fn next_id(&mut self) -> ConnectionId {
-        let ret = ConnectionId(self.0);
-        self.0 += 2;
-        ret
+        ConnectionId(self.0.fetch_add(2, Ordering::Relaxed))
     }
 }
 
@@ -231,5 +233,34 @@ impl SmolPacket {
             SmolPacket::V4(packet) => packet.fill_checksum(),
             SmolPacket::V6(_) => (),
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_id_tests {
+    use super::*;
+
+    #[test]
+    fn connection_ids_are_unique_across_generators() {
+        let mut first_udp = ConnectionIdGenerator::udp();
+        let mut second_udp = ConnectionIdGenerator::udp();
+        let mut first_tcp = ConnectionIdGenerator::tcp();
+        let mut second_tcp = ConnectionIdGenerator::tcp();
+        let ids = [
+            first_udp.next_id(),
+            second_udp.next_id(),
+            first_tcp.next_id(),
+            second_tcp.next_id(),
+        ];
+        assert!(!ids[0].is_tcp());
+        assert!(!ids[1].is_tcp());
+        assert!(ids[2].is_tcp());
+        assert!(ids[3].is_tcp());
+        assert_eq!(
+            ids.into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
     }
 }

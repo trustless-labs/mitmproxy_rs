@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use lru_time_cache::LruCache;
-use tokio::sync::mpsc::Permit;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::messages::{
@@ -135,8 +135,8 @@ impl UdpHandler {
         &mut self,
         packet: UdpPacket,
         tunnel_info: TunnelInfo,
-        permit: Permit<'_, TransportEvent>,
-    ) {
+        command_tx: Option<UnboundedSender<TransportCommand>>,
+    ) -> Option<TransportEvent> {
         let potential_cid = self
             .id_lookup
             .get(&(packet.src_addr, packet.dst_addr))
@@ -146,6 +146,7 @@ impl UdpHandler {
         match self.connections.get_mut(&potential_cid) {
             Some((state, _)) => {
                 state.add_packet(packet.payload);
+                None
             }
             None => {
                 let mut state = ConnectionState::default();
@@ -155,15 +156,22 @@ impl UdpHandler {
                     .insert((packet.src_addr, packet.dst_addr), connection_id);
                 self.connections
                     .insert(connection_id, (state, (packet.src_addr, packet.dst_addr)));
-                permit.send(TransportEvent::ConnectionEstablished {
+                Some(TransportEvent::ConnectionEstablished {
                     connection_id,
                     src_addr: packet.src_addr,
                     dst_addr: packet.dst_addr,
                     tunnel_info,
-                    command_tx: None,
-                });
+                    command_tx,
+                })
             }
-        };
+        }
+    }
+
+    pub(crate) fn packet_queue_len(&self) -> usize {
+        self.connections
+            .peek_iter()
+            .map(|(_, (state, _))| state.packet_queue_len())
+            .sum()
     }
 
     pub fn poll_delay(&mut self) -> Option<Duration> {

@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::messages::{ConnectionIdGenerator, TransportCommand, TransportEvent, TunnelInfo};
 
@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::network::udp::ConnectionState;
+use crate::network::udp::{UdpHandler, UdpPacket};
 use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -230,69 +230,48 @@ impl ConnectionTask {
             SocketAddr::try_from(addr)
                 .with_context(|| format!("invalid local_address: {addr:?}"))?
         };
-        let mut remote_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let (command_tx, mut command_rx) = unbounded_channel();
-
-        let mut first_packet = Some((tun, local_address, command_tx));
-
-        let mut state = ConnectionState::default();
+        let mut handler = UdpHandler::new();
+        let mut pending_event = None;
+        let mut expiry = tokio::time::interval(Duration::from_secs(5));
 
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
-                Some(packet) = stream.next(), if state.packet_queue_len() < 10 => {
+                _ = expiry.tick() => handler.poll(),
+                permit = self.events.reserve(), if pending_event.is_some() => {
+                    permit?.send(pending_event.take().unwrap());
+                },
+                packet = stream.next(), if pending_event.is_none() && handler.packet_queue_len() < 10 => {
+                    let Some(packet) = packet else { break };
                     let packet = ipc::UdpPacket::decode(
                         packet.context("IPC read error")?
                     ).context("invalid IPC message")?;
                     let Some(remote) = &packet.remote_address else { bail!("no remote addr") };
                     let dst_addr = SocketAddr::try_from(remote).with_context(|| format!("invalid remote_address: {remote:?}"))?;
-
-                    // We can only send ConnectionEstablished once we know the destination address.
-                    if let Some((tun, local_address, command_tx)) = first_packet.take() {
-                        remote_address = dst_addr;
-                        self.events.send(TransportEvent::ConnectionEstablished {
-                            connection_id: ConnectionIdGenerator::udp().next_id(),
+                    pending_event = handler.receive_data(
+                        UdpPacket {
                             src_addr: local_address,
                             dst_addr,
-                            // The host keeps its scope (e.g. fe80::1%en0), which a link-local destination needs.
-                            tunnel_info: TunnelInfo::LocalRedirector {
-                                pid: tun.pid,
-                                process_name: tun.process_name,
-                                remote_endpoint: Some((remote.host.clone(), remote.port as u16)),
-                            },
-                            command_tx: Some(command_tx),
-                        }).await?;
-                    } else if remote_address != dst_addr {
-                        bail!("UDP packet destinations do not match: {remote_address} -> {dst_addr}")
-                    }
-                    // TODO: Make ConnectionState accept Bytes, not Vec<u8>
-                    state.add_packet(packet.data.to_vec());
+                            payload: packet.data.to_vec(),
+                        },
+                        TunnelInfo::LocalRedirector {
+                            pid: tun.pid,
+                            process_name: tun.process_name.clone(),
+                            remote_endpoint: Some((remote.host.clone(), remote.port as u16)),
+                        },
+                        Some(command_tx.clone()),
+                    );
                 },
                 Some(command) = command_rx.recv() => {
-                    match command {
-                        TransportCommand::ReadData(_, _, tx) => {
-                            state.add_reader(tx);
-                        },
-                        TransportCommand::WriteData(_, data) => {
-                            assert!(first_packet.is_none());
-                            let packet = ipc::UdpPacket {
-                                data: Bytes::from(data),
-                                remote_address: Some(remote_address.into()),
-                            };
-                            write_buf.reserve(packet.encoded_len());
-                            packet.encode(&mut write_buf)?;
-                            // Awaiting here isn't ideal because it blocks reading, but what to do.
-                            stream.send(write_buf.split().freeze()).await.ok();
-                        },
-                        TransportCommand::DrainWriter(_, tx) => {
-                            tx.send(()).ok();
-                        },
-                        TransportCommand::CloseConnection(_, half_close) => {
-                            if !half_close {
-                                state.close();
-                                break;
-                            }
-                        }
+                    if let Some(UdpPacket { payload, src_addr, .. }) = handler.handle_transport_command(command) {
+                        let packet = ipc::UdpPacket {
+                            data: Bytes::from(payload),
+                            remote_address: Some(src_addr.into()),
+                        };
+                        write_buf.reserve(packet.encoded_len());
+                        packet.encode(&mut write_buf)?;
+                        stream.send(write_buf.split().freeze()).await.context("failed to send UDP reply")?;
                     }
                 }
             }
@@ -424,6 +403,162 @@ mod tests {
             panic!("expected TCP connection");
         };
         (client, task, command_tx, connection_id, shutdown_tx)
+    }
+
+    async fn spawn_udp_connection(
+        capacity: usize,
+    ) -> Result<(
+        Framed<UnixStream, LengthDelimitedCodec>,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::sync::mpsc::Receiver<TransportEvent>,
+        tokio::sync::watch::Sender<()>,
+        Sender<TransportEvent>,
+    )> {
+        let (mut client, server) = UnixStream::pair()?;
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(capacity);
+        let (shutdown_tx, shutdown_rx) = shutdown::channel();
+        let task = tokio::spawn(ConnectionTask::new(server, events_tx.clone(), shutdown_rx).run());
+        let handshake = NewFlow {
+            message: Some(ipc::new_flow::Message::Udp(UdpFlow {
+                local_address: Some(ipc::Address {
+                    host: "127.0.0.1".into(),
+                    port: 5353,
+                }),
+                tunnel_info: Some(ipc::TunnelInfo {
+                    pid: Some(123),
+                    process_name: Some("sender".into()),
+                }),
+            })),
+        }
+        .encode_to_vec();
+        client.write_u32(handshake.len() as u32).await?;
+        client.write_all(&handshake).await?;
+        let client = Framed::new(client, LengthDelimitedCodec::new());
+        Ok((client, task, events_rx, shutdown_tx, events_tx))
+    }
+
+    #[tokio::test]
+    async fn udp_full_event_queue_does_not_block_existing_connection() -> Result<()> {
+        let (mut client, task, mut events_rx, shutdown_tx, events_tx) =
+            spawn_udp_connection(1).await?;
+        let packet = Bytes::from(
+            ipc::UdpPacket {
+                data: Bytes::from_static(b"packet"),
+                remote_address: Some(ipc::Address {
+                    host: "127.0.0.1".into(),
+                    port: 53,
+                }),
+            }
+            .encode_to_vec(),
+        );
+        client.send(packet.clone()).await?;
+        let event = timeout(Duration::from_secs(1), events_rx.recv())
+            .await?
+            .unwrap();
+        let TransportEvent::ConnectionEstablished {
+            connection_id,
+            command_tx: Some(ref commands),
+            ..
+        } = event
+        else {
+            panic!("expected UDP connection");
+        };
+        let commands = commands.clone();
+        events_tx.send(event).await?;
+        for _ in 0..2 {
+            client.send(packet.clone()).await?;
+            let (tx, rx) = oneshot::channel();
+            commands.send(TransportCommand::ReadData(connection_id, 1024, tx))?;
+            assert_eq!(timeout(Duration::from_secs(1), rx).await??, b"packet");
+        }
+        drop(shutdown_tx);
+        timeout(Duration::from_secs(1), task).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_destinations_have_independent_connections() -> Result<()> {
+        check_udp_destinations(["10.10.0.219", "100.65.40.14"]).await
+    }
+
+    #[tokio::test]
+    async fn udp_scoped_destinations_have_independent_connections() -> Result<()> {
+        check_udp_destinations(["fe80::1%1", "fe80::1%2"]).await
+    }
+
+    async fn check_udp_destinations(destinations: [&str; 2]) -> Result<()> {
+        let (mut client, task, mut events_rx, shutdown_tx, _events_tx) =
+            spawn_udp_connection(16).await?;
+        let mut connections = Vec::new();
+        for host in destinations {
+            client
+                .send(Bytes::from(
+                    ipc::UdpPacket {
+                        data: Bytes::copy_from_slice(host.as_bytes()),
+                        remote_address: Some(ipc::Address {
+                            host: host.into(),
+                            port: 62941,
+                        }),
+                    }
+                    .encode_to_vec(),
+                ))
+                .await?;
+            let event = timeout(Duration::from_secs(1), events_rx.recv()).await?;
+            let Some(TransportEvent::ConnectionEstablished {
+                connection_id,
+                dst_addr,
+                command_tx: Some(commands),
+                tunnel_info,
+                ..
+            }) = event
+            else {
+                panic!("expected a connection for {host}")
+            };
+            assert_eq!(dst_addr.port(), 62941);
+            assert!(matches!(tunnel_info, TunnelInfo::LocalRedirector {
+                pid: Some(123), ref process_name, ref remote_endpoint,
+            } if process_name.as_deref() == Some("sender")
+                && remote_endpoint == &Some((host.into(), 62941))));
+            let (tx, rx) = oneshot::channel();
+            commands.send(TransportCommand::ReadData(connection_id, 1024, tx))?;
+            assert_eq!(timeout(Duration::from_secs(1), rx).await??, host.as_bytes());
+            connections.push((connection_id, commands));
+        }
+        assert_ne!(connections[0].0, connections[1].0);
+        for (index, (id, commands)) in connections.iter().enumerate().rev() {
+            commands.send(TransportCommand::WriteData(*id, b"reply".to_vec()))?;
+            let reply = timeout(Duration::from_secs(1), client.next())
+                .await?
+                .unwrap()?;
+            let reply = ipc::UdpPacket::decode(reply)?;
+            let remote = reply.remote_address.unwrap();
+            assert_eq!(remote.host, destinations[index]);
+            assert_eq!(remote.port, 62941);
+            assert_eq!(reply.data.as_ref(), b"reply");
+        }
+        connections[0]
+            .1
+            .send(TransportCommand::CloseConnection(connections[0].0, false))?;
+        client
+            .send(Bytes::from(
+                ipc::UdpPacket {
+                    data: Bytes::from_static(b"still open"),
+                    remote_address: Some(ipc::Address {
+                        host: destinations[1].into(),
+                        port: 62941,
+                    }),
+                }
+                .encode_to_vec(),
+            ))
+            .await?;
+        let (tx, rx) = oneshot::channel();
+        connections[1]
+            .1
+            .send(TransportCommand::ReadData(connections[1].0, 1024, tx))?;
+        assert_eq!(timeout(Duration::from_secs(1), rx).await??, b"still open");
+        drop(shutdown_tx);
+        timeout(Duration::from_secs(1), task).await???;
+        Ok(())
     }
 
     #[tokio::test]
