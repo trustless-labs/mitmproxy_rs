@@ -33,13 +33,13 @@ pub fn open_udp_connection(
 
         let (command_tx, command_rx) = unbounded_channel();
 
-        tokio::spawn(async {
+        tokio::spawn(async move {
             let task = UdpClientTask {
                 socket,
                 transport_commands_rx: command_rx,
             };
             if let Err(e) = task.run().await {
-                log::error!("UDP client errored: {e}");
+                log::error!("UDP client errored ({sockname} -> {peername}): {e:#}");
             }
         });
 
@@ -87,6 +87,9 @@ async fn udp_connect(
                 continue;
             }
         };
+        if addr.is_ipv4() {
+            socket.set_broadcast(true)?;
+        }
         match socket.connect(addr).await {
             Ok(()) => return Ok(socket),
             Err(e) => last_err = Some(e.into()),
@@ -189,6 +192,22 @@ impl UdpClientTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn udp_client_delivers_broadcast() -> Result<()> {
+        let server = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket =
+            udp_connect("255.255.255.255".into(), server.local_addr()?.port(), None).await?;
+        socket.send(b"broadcast").await?;
+        let mut buffer = [0; 32];
+        let (size, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.recv_from(&mut buffer),
+        )
+        .await??;
+        assert_eq!(&buffer[..size], b"broadcast");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_udp_client_echo() -> Result<()> {
